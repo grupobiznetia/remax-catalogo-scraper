@@ -8,9 +8,10 @@ name: scrape
 #   MARKET_INGEST_SECRET  = (el mismo valor que el secret MARKET_INGEST_SECRET de Supabase)
 
 on:
-  schedule:
-    - cron: '0 5 * * *'   # 05:00 UTC = 02:00 AM Argentina
-  workflow_dispatch: {}    # botón "Run workflow"
+  workflow_dispatch: {}    # solo manual
+  # NOTA: el cron está desactivado. RE/MAX filtra por IP y los runners de GitHub
+  # (Azure) reciben ~44 propiedades en vez de ~3500. Correr el scraper desde una
+  # IP argentina / no-datacenter (la PC de Marcelo, Task Scheduler). Ver README.
 
 concurrency:
   group: scrape
