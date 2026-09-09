@@ -12,7 +12,7 @@ import requests
 import json
 import time
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Dict, Optional
 import logging
 
@@ -47,19 +47,35 @@ AREA_WITHINAREA = os.environ.get("AREA_WITHINAREA", _CORDOBA_POLY)
 ONLY_PROVINCIA = os.environ.get("ONLY_PROVINCIA", "Córdoba")  # vacío = sin filtro
 
 
+INGEST_BATCH = int(os.environ.get("INGEST_BATCH", "300"))
+
+
 def post_to_ingest(properties: List[Dict]) -> None:
     if not INGEST_URL or not INGEST_SECRET:
         logger.info("MARKET_INGEST_URL/SECRET no seteados — no se envía a Supabase")
         return
-    logger.info(f"Enviando {len(properties)} propiedades a {INGEST_URL} ...")
-    r = requests.post(
-        INGEST_URL,
-        headers={"Content-Type": "application/json", "x-ingest-secret": INGEST_SECRET},
-        data=json.dumps({"properties": properties}).encode("utf-8"),
-        timeout=180,
-    )
-    logger.info(f"Ingest respondió {r.status_code}: {r.text[:600]}")
-    r.raise_for_status()
+    run_ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    total = len(properties)
+    logger.info(f"Enviando {total} propiedades a {INGEST_URL} en tandas de {INGEST_BATCH} (run_ts={run_ts})")
+    for i in range(0, max(total, 1), INGEST_BATCH):
+        chunk = properties[i:i + INGEST_BATCH]
+        is_last = (i + INGEST_BATCH) >= total
+        payload = {
+            "properties": chunk,
+            "source": "remax",
+            "run_ts": run_ts,
+            "snapshot_complete": is_last,
+        }
+        r = requests.post(
+            INGEST_URL,
+            headers={"Content-Type": "application/json", "x-ingest-secret": INGEST_SECRET},
+            data=json.dumps(payload).encode("utf-8"),
+            timeout=120,
+        )
+        logger.info(f"  tanda {i // INGEST_BATCH + 1} ({len(chunk)} props, final={is_last}): "
+                    f"HTTP {r.status_code} {r.text[:400]}")
+        r.raise_for_status()
+    logger.info("Ingest completo.")
 
 class RemaxCordobaScraper:
     def __init__(self):
@@ -231,20 +247,28 @@ class RemaxCordobaScraper:
         if slug in self.detail_cache:
             return self.detail_cache[slug]
 
-        try:
-            time.sleep(0.25)  # no saturar el endpoint de detalle
-            url = f"{self.base_url}/listings/findBySlug/{slug}"
-            response = requests.get(url, headers=self.headers, timeout=15)
-            response.raise_for_status()
-            data = response.json()
-            
-            details = data.get("data", {})
-            self.detail_cache[slug] = details
-            return details
-            
-        except Exception as e:
-            logger.warning(f"No se pudieron obtener detalles para slug {slug}: {e}")
-            return None
+        url = f"{self.base_url}/listings/findBySlug/{slug}"
+        for attempt in range(4):
+            try:
+                time.sleep(0.25)  # no saturar el endpoint de detalle
+                response = requests.get(url, headers=self.headers, timeout=20)
+                if response.status_code == 429 or response.status_code >= 500:
+                    wait = 2 ** attempt
+                    logger.warning(f"detalle {slug}: HTTP {response.status_code}, reintento en {wait}s")
+                    time.sleep(wait)
+                    continue
+                response.raise_for_status()
+                details = response.json().get("data", {}) or {}
+                self.detail_cache[slug] = details
+                return details
+            except Exception as e:
+                if attempt == 3:
+                    logger.warning(f"detalle {slug} falló definitivo: {e}")
+                    self.detail_cache[slug] = {}
+                    return {}
+                time.sleep(2 ** attempt)
+        self.detail_cache[slug] = {}
+        return {}
     
     def normalize_operation(self, raw_value: str) -> str:
         normalized = self.operation_map.get(raw_value.lower() if raw_value else "")
@@ -400,12 +424,10 @@ class RemaxCordobaScraper:
                 logger.warning(f"Propiedad {source_id} sin slug, descartando")
                 return None
             
-            # === DETALLE COMPLETO (findBySlug) ===
-            details = self.get_property_details(slug)
-            if not details:
-                logger.warning(f"Propiedad {source_id} sin detalle, descartando")
-                return None
-            
+            # === DETALLE COMPLETO (findBySlug) — si falla, seguimos con datos de lista ===
+            details = self.get_property_details(slug) or {}
+            detail_ok = bool(details.get("geo") or details.get("description"))
+
             # === CLASIFICACIÓN (del findAll, confiable) ===
             operation_raw = prop.get("operation", {}).get("value", "sale")
             operation = self.normalize_operation(operation_raw)
@@ -560,6 +582,7 @@ class RemaxCordobaScraper:
                 # Bonus flags
                 "apt_credit": apt_credit,
                 "in_private_community": in_private_community,
+                "detail_ok": detail_ok,
                 "pozo": pozo,
                 "financing": financing,
                 "year_built": year_built,
@@ -598,8 +621,12 @@ class RemaxCordobaScraper:
         skipped_fuera_prov = 0
 
         only_prov = ONLY_PROVINCIA.strip().lower()
+        total_raw = len(properties_raw)
 
-        for prop in properties_raw:
+        for idx, prop in enumerate(properties_raw):
+            if (idx + 1) % 200 == 0:
+                logger.info(f"  normalizando {idx + 1}/{total_raw} (ok={len(properties_normalized)})...")
+
             source_id = prop.get("internalId")
             if not source_id:
                 skipped_no_internal += 1
@@ -618,15 +645,10 @@ class RemaxCordobaScraper:
                     skipped_fuera_prov += 1
                     continue
 
-            # Pre-verificar que el detalle exista antes de normalizar
-            if slug not in self.detail_cache:
-                detail = self.get_property_details(slug)
-                if not detail:
-                    skipped_no_detail += 1
-                    continue
-            
             normalized = self.normalize_property(prop)
             if normalized:
+                if not normalized.get("detail_ok"):
+                    skipped_no_detail += 1  # se cargó igual, con datos de lista
                 properties_normalized.append(normalized)
         
         logger.info(f"Total propiedades normalizadas: {len(properties_normalized)}")
@@ -635,7 +657,7 @@ class RemaxCordobaScraper:
         if skipped_no_slug > 0:
             logger.info(f"Descartadas sin slug: {skipped_no_slug}")
         if skipped_no_detail > 0:
-            logger.info(f"Descartadas sin detalle: {skipped_no_detail}")
+            logger.info(f"Sin detalle (cargadas con datos de lista): {skipped_no_detail}")
         if skipped_fuera_prov > 0:
             logger.info(f"Descartadas fuera de provincia ({ONLY_PROVINCIA}): {skipped_fuera_prov}")
         
