@@ -3,3 +3,7 @@ remax_cordoba_properties.json
 raw_property_dump.json
 raw_detail_dump.json
 __pycache__/
+
+# no commitear el wrapper local (tiene el secret)
+correr.bat
+*.bat
