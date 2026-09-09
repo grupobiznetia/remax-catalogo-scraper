@@ -21,9 +21,30 @@ logger = logging.getLogger(__name__)
 
 # --- Config (env) ---
 OPERATION_IDS = [int(x) for x in os.environ.get("OPERATION_IDS", "1").split(",") if x.strip()]  # 1=venta, 2=alquiler
-MAX_PROPS = int(os.environ.get("MAX_PROPS", "0"))  # 0 = sin tope (toda Córdoba)
+MAX_PROPS = int(os.environ.get("MAX_PROPS", "0"))  # 0 = sin tope
 INGEST_URL = os.environ.get("MARKET_INGEST_URL", "")
 INGEST_SECRET = os.environ.get("MARKET_INGEST_SECRET", "")
+
+# Polígono que cubre toda la provincia de Córdoba (26 puntos lng lat, del mapa de remax.com.ar).
+# La API usa `withinarea`, no `locations` (ese id de barrio no sirve para toda la provincia).
+_CORDOBA_POLY = (
+    "location:-63.15355643373719 -34.33979540938583,-64.42797049623718 -34.33072343414419,"
+    "-65.03221854311218 -34.07631024973466,-64.98827323061218 -33.11315676356412,"
+    "-64.83446463686218 -32.346077548619775,-64.98827323061218 -32.27876093476629,"
+    "-65.16405448061218 -32.27643878019716,-65.24095877748718 -32.06021888208314,"
+    "-65.40300711733093 -31.981042772584676,-65.5938945685028 -31.63442918027538,"
+    "-65.58702811342468 -31.367461841356093,-65.34944876772155 -30.567924166273414,"
+    "-65.02947196108093 -30.058146651438143,-64.35861929994812 -30.363708116577303,"
+    "-64.72872122865905 -30.153752310544725,-64.80562552553405 -29.66808333886819,"
+    "-63.88826712709656 -29.390866142940748,-62.66878470522156 -30.00639770898353,"
+    "-62.23482474428406 -30.310372086346813,-61.76241263490906 -30.66539560970916,"
+    "-62.05904349428406 -31.530863702179722,-62.41884574037781 -32.032833918550246,"
+    "-62.41905710521496 -32.60627600499042,-62.06749460521496 -32.878876202052474,"
+    "-61.98509714427746 -33.192022493305664,-62.87498972240246 -34.37448014168884"
+)
+AREA_WITHINAREA = os.environ.get("AREA_WITHINAREA", _CORDOBA_POLY)
+# El polígono es a mano y se pasa un poco a provincias vecinas; este filtro deja solo la provincia real.
+ONLY_PROVINCIA = os.environ.get("ONLY_PROVINCIA", "Córdoba")  # vacío = sin filtro
 
 
 def post_to_ingest(properties: List[Dict]) -> None:
@@ -147,7 +168,7 @@ class RemaxCordobaScraper:
         page = 0
         max_props = MAX_PROPS  # 0 = sin tope
 
-        while True:
+        while page < 500:  # tope duro de páginas por seguridad
             url = f"{self.base_url}/listings/findAll"
             params = {
                 "page": page,
@@ -155,16 +176,18 @@ class RemaxCordobaScraper:
                 "sort": "-createdAt",
                 "in": f"operationId:{','.join(map(str, operation_ids))}",
                 "in:typeId": "1,2,3,4,5,6,7,8",
-                "locations": "in:::::2827@cordoba::"  # toda la provincia de Córdoba
+                "withinarea": AREA_WITHINAREA  # polígono provincia de Córdoba
             }
-            
+
             try:
                 response = requests.get(url, params=params, headers=self.headers, timeout=30)
                 response.raise_for_status()
                 data = response.json()
-                
+
                 properties = data.get("data", {}).get("data", [])
                 if not properties:
+                    if page == 0:
+                        logger.error("Página 0 devolvió 0 propiedades — revisar el área/filtros")
                     break
                     
                 if not self.dumped_raw and properties:
@@ -572,18 +595,29 @@ class RemaxCordobaScraper:
         skipped_no_internal = 0
         skipped_no_slug = 0
         skipped_no_detail = 0
-        
+        skipped_fuera_prov = 0
+
+        only_prov = ONLY_PROVINCIA.strip().lower()
+
         for prop in properties_raw:
             source_id = prop.get("internalId")
             if not source_id:
                 skipped_no_internal += 1
                 continue
-            
+
             slug = prop.get("slug")
             if not slug:
                 skipped_no_slug += 1
                 continue
-            
+
+            # Filtro de provincia ANTES de la llamada de detalle (ahorra requests):
+            # addressInfo del objeto de lista termina en la provincia ("..., Córdoba").
+            if only_prov:
+                ai = (prop.get("addressInfo") or "").strip().lower()
+                if ai and not ai.endswith(only_prov):
+                    skipped_fuera_prov += 1
+                    continue
+
             # Pre-verificar que el detalle exista antes de normalizar
             if slug not in self.detail_cache:
                 detail = self.get_property_details(slug)
@@ -602,6 +636,8 @@ class RemaxCordobaScraper:
             logger.info(f"Descartadas sin slug: {skipped_no_slug}")
         if skipped_no_detail > 0:
             logger.info(f"Descartadas sin detalle: {skipped_no_detail}")
+        if skipped_fuera_prov > 0:
+            logger.info(f"Descartadas fuera de provincia ({ONLY_PROVINCIA}): {skipped_fuera_prov}")
         
         with open(output_file, 'w', encoding='utf-8') as f:
             for prop in properties_normalized:
