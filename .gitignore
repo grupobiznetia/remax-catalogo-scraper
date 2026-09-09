@@ -2,6 +2,9 @@ remax_cordoba_properties.ndjson
 remax_cordoba_properties.json
 raw_property_dump.json
 raw_detail_dump.json
+detail_cache.json
+detail_cache.json.tmp
+salida.txt
 __pycache__/
 
 # no commitear el wrapper local (tiene el secret)

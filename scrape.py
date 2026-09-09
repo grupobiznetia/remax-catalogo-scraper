@@ -49,6 +49,21 @@ ONLY_PROVINCIA = os.environ.get("ONLY_PROVINCIA", "Córdoba")  # vacío = sin fi
 
 INGEST_BATCH = int(os.environ.get("INGEST_BATCH", "300"))
 
+# --- Cache incremental de detalles ---
+# El detalle (findBySlug) es lo lento: 1 request por propiedad. Se cachea en disco y
+# solo se vuelve a bajar si la propiedad es nueva, si le cambió el precio de lista, o
+# si el dato cacheado tiene más de DETAIL_MAX_AGE_DAYS (para captar ediciones silenciosas).
+DETAIL_CACHE_FILE = os.environ.get("DETAIL_CACHE_FILE", "detail_cache.json")
+FULL_REFRESH = os.environ.get("FULL_REFRESH", "").strip().lower() in ("1", "true", "yes")
+DETAIL_MAX_AGE_DAYS = int(os.environ.get("DETAIL_MAX_AGE_DAYS", "30"))
+
+
+def _norm_price(p):
+    try:
+        return round(float(p), 2)
+    except (TypeError, ValueError):
+        return None
+
 
 def post_to_ingest(properties: List[Dict]) -> None:
     if not INGEST_URL or not INGEST_SECRET:
@@ -176,7 +191,40 @@ class RemaxCordobaScraper:
         
         self.detail_cache = {}
         self.dumped_raw = False
-        
+
+        # Cache incremental de detalles (persistente en disco entre corridas)
+        self.pcache = {}
+        self.pcache_hits = 0
+        self.pcache_miss = 0
+        self._load_pcache()
+
+    def _load_pcache(self):
+        if FULL_REFRESH:
+            logger.info("FULL_REFRESH — se ignora el cache de detalles, se baja todo de nuevo")
+            return
+        try:
+            with open(DETAIL_CACHE_FILE, "r", encoding="utf-8") as f:
+                self.pcache = json.load(f)
+            logger.info(f"Cache de detalles: {len(self.pcache)} propiedades ({DETAIL_CACHE_FILE})")
+        except FileNotFoundError:
+            logger.info(f"Sin cache previo ({DETAIL_CACHE_FILE}) — primera corrida, se baja todo el detalle")
+        except Exception as e:
+            logger.warning(f"No se pudo leer {DETAIL_CACHE_FILE} ({e}) — se baja todo el detalle")
+            self.pcache = {}
+
+    def _save_pcache(self, active_ids):
+        # Deja solo lo que sigue en el catálogo para que el archivo no crezca sin fin.
+        pruned = {sid: v for sid, v in self.pcache.items() if sid in active_ids}
+        try:
+            tmp = DETAIL_CACHE_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(pruned, f, ensure_ascii=False)
+            os.replace(tmp, DETAIL_CACHE_FILE)
+            logger.info(f"Cache de detalles guardado: {len(pruned)} propiedades "
+                        f"(reutilizadas {self.pcache_hits}, bajadas nuevas {self.pcache_miss})")
+        except Exception as e:
+            logger.warning(f"No se pudo guardar {DETAIL_CACHE_FILE}: {e}")
+
     def get_all_properties(self, operation_ids: List[int] = None, page_size: int = 100) -> List[Dict]:
         if operation_ids is None:
             operation_ids = OPERATION_IDS
@@ -424,8 +472,36 @@ class RemaxCordobaScraper:
                 logger.warning(f"Propiedad {source_id} sin slug, descartando")
                 return None
             
-            # === DETALLE COMPLETO (findBySlug) — si falla, seguimos con datos de lista ===
-            details = self.get_property_details(slug) or {}
+            # === DETALLE (findBySlug) — INCREMENTAL ===
+            # Se reusa del cache si el precio de lista no cambió y el dato no está vencido.
+            # Si no, se baja y se cachea. Si el detalle falla, NO se cachea (se reintenta
+            # la próxima corrida) y se sigue con los datos de lista.
+            cached = self.pcache.get(source_id)
+            reuse = False
+            if cached and cached.get("detail"):
+                same_price = _norm_price(cached.get("price")) == _norm_price(prop.get("price"))
+                fresh = True
+                if DETAIL_MAX_AGE_DAYS > 0 and cached.get("ts"):
+                    try:
+                        age_days = (datetime.now(timezone.utc)
+                                    - datetime.fromisoformat(cached["ts"])).days
+                        fresh = age_days < DETAIL_MAX_AGE_DAYS
+                    except Exception:
+                        fresh = True
+                reuse = same_price and fresh
+
+            if reuse:
+                details = cached["detail"]
+                self.pcache_hits += 1
+            else:
+                details = self.get_property_details(slug) or {}
+                self.pcache_miss += 1
+                if details.get("geo") or details.get("description"):
+                    self.pcache[source_id] = {
+                        "price": prop.get("price"),
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                        "detail": details,
+                    }
             detail_ok = bool(details.get("geo") or details.get("description"))
 
             # === CLASIFICACIÓN (del findAll, confiable) ===
@@ -650,8 +726,12 @@ class RemaxCordobaScraper:
                 if not normalized.get("detail_ok"):
                     skipped_no_detail += 1  # se cargó igual, con datos de lista
                 properties_normalized.append(normalized)
-        
+
+        # Guardar cache incremental (solo lo que sigue en el catálogo)
+        self._save_pcache({p["source_id"] for p in properties_normalized})
+
         logger.info(f"Total propiedades normalizadas: {len(properties_normalized)}")
+        logger.info(f"  detalle reutilizado del cache: {self.pcache_hits} | bajado ahora: {self.pcache_miss}")
         if skipped_no_internal > 0:
             logger.info(f"Descartadas sin internalId: {skipped_no_internal}")
         if skipped_no_slug > 0:
