@@ -1,0 +1,45 @@
+name: scrape
+
+# Corrida nocturna: baja el catálogo de RE/MAX Córdoba y lo sincroniza con la
+# tabla market_properties de Supabase vía la edge function market-ingest.
+#
+# Secrets requeridos (repo -> Settings -> Secrets and variables -> Actions):
+#   MARKET_INGEST_URL     = https://jbuyrufuaxlajwxdbbub.supabase.co/functions/v1/market-ingest
+#   MARKET_INGEST_SECRET  = (el mismo valor que el secret MARKET_INGEST_SECRET de Supabase)
+
+on:
+  schedule:
+    - cron: '0 5 * * *'   # 05:00 UTC = 02:00 AM Argentina
+  workflow_dispatch: {}    # botón "Run workflow"
+
+concurrency:
+  group: scrape
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements.txt
+      - name: Scrape + ingest
+        env:
+          MARKET_INGEST_URL: ${{ secrets.MARKET_INGEST_URL }}
+          MARKET_INGEST_SECRET: ${{ secrets.MARKET_INGEST_SECRET }}
+          OPERATION_IDS: '1'   # 1=venta (poner '1,2' para sumar alquileres)
+          MAX_PROPS: '0'       # 0 = sin tope
+        run: python scrape.py
+      - name: Guardar NDJSON como artefacto
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: remax-cordoba
+          path: |
+            remax_cordoba_properties.ndjson
+            remax_cordoba_properties.json
+          retention-days: 5
+          if-no-files-found: ignore
