@@ -57,6 +57,9 @@ DETAIL_CACHE_FILE = os.environ.get("DETAIL_CACHE_FILE", "detail_cache.json")
 FULL_REFRESH = os.environ.get("FULL_REFRESH", "").strip().lower() in ("1", "true", "yes")
 DETAIL_MAX_AGE_DAYS = int(os.environ.get("DETAIL_MAX_AGE_DAYS", "30"))
 
+# CDN de fotos de RE/MAX (CloudFront). Si algún día rotan la distribución, se cambia acá.
+REMAX_CDN = os.environ.get("REMAX_CDN", "https://d1acdg20u0pmxj.cloudfront.net").rstrip("/")
+
 
 def _norm_price(p):
     try:
@@ -596,14 +599,19 @@ class RemaxCordobaScraper:
             broker_license = self.normalize_broker_license(broker.get("license", ""))
             
             # === FOTO (del findAll) ===
+            # 'value' viene como "listings/{uuid}/{uuid}.jpg" (con extensión).
+            # El CDN real de RE/MAX es CloudFront y sirve sin hotlink protection
+            # (probado: 200 desde cualquier referer). 'cdn.remax.com.ar' no existe.
             photos = prop.get("photos", [])
             cover_photo = ""
             if photos:
-                raw_photo = photos[0].get("rawValue", "")
-                if raw_photo and not raw_photo.startswith("http"):
-                    cover_photo = f"https://cdn.remax.com.ar/{raw_photo}"
-                else:
-                    cover_photo = raw_photo
+                val = photos[0].get("value") or photos[0].get("rawValue") or ""
+                if val and not val.endswith(".jpg") and "/" in val:
+                    val = val + ".jpg"
+                if val.startswith("http"):
+                    cover_photo = val
+                elif val:
+                    cover_photo = f"{REMAX_CDN}/{val.lstrip('/')}"
             
             # === SOURCE URL ===
             source_url = f"https://www.remax.com.ar/propiedad/{source_id}"
