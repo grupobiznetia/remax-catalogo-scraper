@@ -10,3 +10,7 @@ __pycache__/
 # no commitear el wrapper local (tiene el secret)
 correr.bat
 *.bat
+
+# salidas de runtime del scheduler local
+task-log.txt
+ultima-sync-ok.txt

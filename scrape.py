@@ -49,6 +49,13 @@ ONLY_PROVINCIA = os.environ.get("ONLY_PROVINCIA", "Córdoba")  # vacío = sin fi
 
 INGEST_BATCH = int(os.environ.get("INGEST_BATCH", "300"))
 
+# SKIP_SYNC=1 fuerza snapshot_complete=False en TODAS las tandas: market-ingest hace el
+# upsert normal pero NO desactiva las propiedades que no vinieron. Imprescindible para las
+# pruebas chicas (MAX_PROPS acotado): sin esto, la última tanda manda snapshot_complete=true
+# y market-ingest desactiva todo lo que no estaba en la muestra (incidente 2026-10-22: una
+# prueba de 30 props desactivó 350 de RE/MAX Docta). Las corridas completas NO lo setean.
+SKIP_SYNC = os.environ.get("SKIP_SYNC", "").strip().lower() in ("1", "true", "yes")
+
 # --- Cache incremental de detalles ---
 # El detalle (findBySlug) es lo lento: 1 request por propiedad. Se cachea en disco y
 # solo se vuelve a bajar si la propiedad es nueva, si le cambió el precio de lista, o
@@ -78,11 +85,12 @@ def post_to_ingest(properties: List[Dict]) -> None:
     for i in range(0, max(total, 1), INGEST_BATCH):
         chunk = properties[i:i + INGEST_BATCH]
         is_last = (i + INGEST_BATCH) >= total
+        snapshot_complete = is_last and not SKIP_SYNC
         payload = {
             "properties": chunk,
             "source": "remax",
             "run_ts": run_ts,
-            "snapshot_complete": is_last,
+            "snapshot_complete": snapshot_complete,
         }
         r = requests.post(
             INGEST_URL,
@@ -90,8 +98,8 @@ def post_to_ingest(properties: List[Dict]) -> None:
             data=json.dumps(payload).encode("utf-8"),
             timeout=120,
         )
-        logger.info(f"  tanda {i // INGEST_BATCH + 1} ({len(chunk)} props, final={is_last}): "
-                    f"HTTP {r.status_code} {r.text[:400]}")
+        logger.info(f"  tanda {i // INGEST_BATCH + 1} ({len(chunk)} props, final={is_last}, "
+                    f"sync={snapshot_complete}): HTTP {r.status_code} {r.text[:400]}")
         r.raise_for_status()
     logger.info("Ingest completo.")
 
