@@ -9,6 +9,14 @@ Bonus: apt_credit, in_private_community, pozo, financing, year_built,
 import os
 import sys
 import requests
+# Avast (y otros antivirus) interceptan HTTPS con su propio certificado raíz, que está en el
+# almacén de Windows pero no en el de Python: sin esto, requests da CERTIFICATE_VERIFY_FAILED
+# (incidente 2026-10-27). truststore hace que Python use los certificados del sistema.
+try:
+    import truststore
+    truststore.inject_into_ssl()
+except ImportError:
+    pass
 import json
 import time
 import re
@@ -226,6 +234,10 @@ class RemaxCordobaScraper:
     def _save_pcache(self, active_ids):
         # Deja solo lo que sigue en el catálogo para que el archivo no crezca sin fin.
         pruned = {sid: v for sid, v in self.pcache.items() if sid in active_ids}
+        # Una corrida fallida (0 propiedades) no puede vaciar el cache (incidente 2026-10-27).
+        if not pruned and self.pcache:
+            logger.warning("0 propiedades en esta corrida: no se toca el cache de detalles")
+            return
         try:
             tmp = DETAIL_CACHE_FILE + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
